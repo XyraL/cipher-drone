@@ -1,9 +1,7 @@
 Config = {}
 
--- Framework & inventory settings
-Config.Framework = {
-  mode = 'auto', -- 'auto' | 'qb' | 'qbox'
-}
+-- Framework is auto-detected by bridge/framework.lua (qbx_core or qb-core).
+-- No config knob here — edit the bridge file directly if you need to force one.
 
 Config.Inventory = {
   mode = 'auto', -- 'auto' | 'ox_inventory' | 'qb-inventory'
@@ -27,9 +25,9 @@ Config.Drone = {
   model = `ch_prop_casino_drone_02a`, -- change if desired
   spawnOffset = vec3(1.5, 1.0, 0.2),
 
-  maxSpeed = 16.0, 
-  accel = 16.0, 
-  brake = 12.0, 
+  maxSpeed = 24.0,
+  accel = 22.0,
+  brake = 16.0,
 
   verticalSpeed = 9.0, -- Up/Down speed (increase for faster altitude changes)
   climbSpeed = 9.0, -- alias (used for Space/Ctrl climb rate)
@@ -45,7 +43,8 @@ Config.Drone = {
   batteryDrainThermalMult = 1.15,
 
   canBeShotDown = true,
-  damageMultiplier = 3.0, -- only used if canBeShotDown=true
+  baseHealth = 200, -- entity health at spawn before damageMultiplier scaling
+  damageMultiplier = 3.0, -- effective HP = baseHealth / damageMultiplier (higher = dies faster to gunfire)
   invincibleIfDisabled = true, -- if canBeShotDown=false
 
   -- Shot-down polish
@@ -184,6 +183,32 @@ Config.Tracker = {
 
 }
 
+-- Criminal-side counterplay: a deployable jammer that degrades a nearby
+-- operator's drone control instead of killing the link outright.
+Config.Jamming = {
+  enabled = true,
+
+  item = 'cipher_jammer', -- consumable, used at the player's current position
+
+  maxDistance = 60.0, -- meters from the jammer to the drone for it to be affected
+  maxActivePerPlayer = 1,
+  cooldownSeconds = 90,
+  durationSeconds = 20,
+
+  restrictToJobs = false, -- if true, only jobs listed below can deploy a jammer
+  allowedJobs = {},
+
+  serverTickMs = 1000, -- how often the server checks drone-vs-jammer distances
+
+  -- Degraded-control tuning (jitter, not a hard lockout)
+  intensity = {
+    lookMultiplierMin = 0.6,
+    lookMultiplierMax = 1.4,
+    driftForce = 0.15,
+    driftIntervalMs = 1500,
+  },
+}
+
 Config.Keybinds = {
   forward = 'W',
   back = 'S',
@@ -207,11 +232,11 @@ Config.UI = {
   theme = {
     primary = '#38BDF8',
     accent = '#FBBF24',
-    logoUrl = 'logo.png', 
+    logoUrl = 'logo.png',
   },
   showHints = true,
-}
 
-Config.Notifications = {
-  mode = 'auto', -- 'auto' | 'ox_lib' | 'qb' | 'print'
+  showCompass = true,
+  showRadar = true,
+  radarRange = 300.0, -- meters; tracker blips beyond this clamp to the radar's edge
 }

@@ -2,30 +2,31 @@ fx_version 'cerulean'
 game 'gta5'
 lua54 'yes'
 
-name 'GS-DroneSystem'
-author 'GooberScripts'
-description 'Deployable drone with live cam, thermal, spotlight, tracker dart (config-driven)'
-version '1.0.0'
+name 'cipher-drone'
+author 'XyraL'
+description 'Cipher — Drone. Deployable police drone with live cam, thermal, spotlight, tracker darts, shoot-down, and criminal-side jamming counterplay.'
+version '2.0.0'
 
 shared_scripts {
   'config.lua',
-  'shared/utils.lua',
 }
 
 client_scripts {
+  'bridge/framework.lua',
   'client/main.lua',
 }
 
 server_scripts {
+  'bridge/framework.lua',
   'server/main.lua',
 }
 
-ui_page 'web/index.html'
+ui_page 'html/index.html'
 
 files {
-  'web/index.html',
-  'web/style.css',
-  'web/app.js',
+  'html/index.html',
+  'html/css/style.css',
+  'html/js/app.js',
   'logo.png',
 }
 

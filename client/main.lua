@@ -1,7 +1,3 @@
-local Framework = Config.Framework.mode == 'auto' and GS.AutoFramework() or Config.Framework.mode
-local Inventory = Config.Inventory.mode == 'auto' and GS.AutoInventory() or Config.Inventory.mode
-
-
 local function GetDroneBasis(ent)
   -- Returns forward and right vectors without relying on GetEntityRightVector/GetEntityMatrix.
   local pos = GetEntityCoords(ent)
@@ -131,25 +127,9 @@ local function setOperatorLock(enable)
   end
 end
 
-local function drawBootOverlay(progress)
-  local w, h = 0.34, 0.06
-  local x, y = 0.5, 0.86
-
-  DrawRect(x, y, w, h, 0, 0, 0, 150)
-
-  local pad = 0.01
-  local barW = (w - pad * 2) * math.max(0.0, math.min(1.0, progress or 0.0))
-  DrawRect(x - (w/2) + pad + (barW/2), y, barW, 0.018, 0, 200, 255, 200)
-
-  SetTextFont(4)
-  SetTextScale(0.35, 0.35)
-  SetTextColour(255, 255, 255, 230)
-  SetTextCentre(true)
-  BeginTextCommandDisplayText('STRING')
-  AddTextComponentSubstringPlayerName('DRONE LINK: INITIALIZING')
-  EndTextCommandDisplayText(x, y - 0.018)
-end
-
+-- Boot overlay is rendered by the NUI ('boot' message) instead of native
+-- DrawRect/DrawText — gives us the cinematic scan/glitch styling without
+-- hand-rolling text positioning in Lua.
 local function runBootSequence()
   if not Config.Boot or not Config.Boot.enabled then return true end
 
@@ -164,14 +144,20 @@ local function runBootSequence()
   -- rotor idle sound
   PlaySoundFrontend(-1, 'NAV_UP_DOWN', 'HUD_FRONTEND_DEFAULT_SOUNDSET', true)
 
+  if Config.UI.enabled then
+    SendNUIMessage({ type = 'boot', show = true, seconds = seconds, theme = Config.UI.theme })
+  end
+
   local started = GetGameTimer()
   local duration = math.floor(seconds * 1000)
 
   while (GetGameTimer() - started) < duration do
     DisableAllControlActions(0)
-    local t = (GetGameTimer() - started) / duration
-    drawBootOverlay(t)
     Wait(0)
+  end
+
+  if Config.UI.enabled then
+    SendNUIMessage({ type = 'boot', show = false })
   end
 
   -- slight lift effect
@@ -191,6 +177,48 @@ end
 local droneMapBlip = nil
 local minimapLocked = false
 
+-- Declared here (not at first use below) so the radar computation inside
+-- the flight thread — defined earlier in the file than the trackerPing
+-- handler — can see it as an upvalue.
+local trackerBlips = {} -- [trackerId] = blip
+
+-- Heading-up mini-radar: projects each active tracker blip into the
+-- drone's forward/right frame (same vecFromHeadingDeg/rightFromHeadingDeg
+-- used for flight) so the NUI side only has to place a dot, no trig.
+local function sendRadarUpdate()
+  if not Config.UI.enabled or not Config.UI.showRadar then return end
+  if not state.drone or state.drone == 0 or not DoesEntityExist(state.drone) then return end
+
+  local dpos = GetEntityCoords(state.drone)
+  local heading = GetEntityHeading(state.drone)
+  local fwd = vecFromHeadingDeg(heading)
+  local rgt = rightFromHeadingDeg(heading)
+  local range = tonumber(Config.UI.radarRange) or 300.0
+
+  local blips = {}
+  for _, blip in pairs(trackerBlips) do
+    if blip and DoesBlipExist(blip) then
+      local bpos = GetBlipCoords(blip)
+      local dx = bpos.x - dpos.x
+      local dy = bpos.y - dpos.y
+
+      local rx = dx * rgt.x + dy * rgt.y
+      local ry = dx * fwd.x + dy * fwd.y
+
+      local dist = math.sqrt(rx * rx + ry * ry)
+      if dist > range and dist > 0.001 then
+        local s = range / dist
+        rx = rx * s
+        ry = ry * s
+      end
+
+      blips[#blips + 1] = { x = rx / range, y = ry / range }
+    end
+  end
+
+  SendNUIMessage({ type = 'radar', blips = blips })
+end
+
 local function MinimapLockToDrone(enable)
   if enable then
     minimapLocked = true
@@ -201,8 +229,15 @@ local function MinimapLockToDrone(enable)
   end
 end
 
-RegisterNetEvent('gs-drone:client:useItem', function()
-  TriggerServerEvent('gs-drone:server:useDroneItem')
+RegisterNetEvent('cipher-drone:client:useItem', function()
+  TriggerServerEvent('cipher-drone:server:useDroneItem')
+end)
+
+-- ox_inventory hook point for QBox, since qbx_core has no server-side
+-- useable-item registration API. Point the jammer item's ox_inventory
+-- `client.event` at this.
+RegisterNetEvent('cipher-drone:client:useJammerItem', function()
+  TriggerServerEvent('cipher-drone:server:useJammerItem')
 end)
 
 local function nui(show)
@@ -212,7 +247,10 @@ local function nui(show)
     type = 'toggle',
     state = show and true or false,
     theme = Config.UI.theme,
-    showHints = Config.UI.showHints
+    showHints = Config.UI.showHints,
+    canBeShotDown = Config.Drone.canBeShotDown and true or false,
+    showCompass = Config.UI.showCompass and true or false,
+    showRadar = Config.UI.showRadar and true or false,
   })
 end
 
@@ -223,10 +261,17 @@ local function nuiUpdate()
   local dpos = GetEntityCoords(state.drone)
   local dist = #(ppos - dpos)
 
+  local health = nil
+  if Config.Drone.canBeShotDown and state.droneMaxHealth then
+    health = math.floor(math.max(0, math.min(100, (GetEntityHealth(state.drone) / state.droneMaxHealth) * 100)))
+  end
+
   SendNUIMessage({
     type = 'update',
     battery = math.floor((state.battery / state.batteryMax) * 100),
     signal = math.floor(math.max(0.0, 100.0 - (dist / Config.Drone.maxRange) * 100.0)),
+    health = health,
+    heading = GetEntityHeading(state.drone),
     spotlight = state.spotlight,
     thermal = state.thermal,
     trackerCd = 0, -- updated by server message when used
@@ -254,6 +299,40 @@ local function PlayPtfx(dict, name, x, y, z, scale)
   if not HasNamedPtfxAssetLoaded(dict) then return end
   UseParticleFxAssetNextCall(dict)
   StartParticleFxNonLoopedAtCoord(name, x, y, z, 0.0, 0.0, 0.0, scale or 1.0, false, false, false)
+end
+
+-- Shoot-down destroy sequence: freeze further damage, let the object fall
+-- naturally (collision + unfrozen position already does this), keep
+-- re-triggering the one-shot smoke/spark ptfx for the fall duration, then
+-- let the caller clean up and end the session.
+local function runDestroySequence(obj)
+  if not obj or obj == 0 or not DoesEntityExist(obj) then return end
+
+  SetEntityInvincible(obj, true)
+
+  SendNUIMessage({ type = 'destroyed' })
+  PlaySoundFrontend(-1, 'Bed', 'WastedSounds', true)
+
+  local seconds = tonumber(Config.Drone.destroyedFallSeconds) or 2.5
+  local started = GetGameTimer()
+  local duration = math.floor(seconds * 1000)
+  local nextFx = 0
+
+  while (GetGameTimer() - started) < duration do
+    if DoesEntityExist(obj) then
+      if GetGameTimer() >= nextFx then
+        nextFx = GetGameTimer() + 400
+        local p = GetEntityCoords(obj)
+        if Config.Drone.destroyedSmokeFx then
+          PlayPtfx(Config.Drone.destroyedSmokeAsset, Config.Drone.destroyedSmokeName, p.x, p.y, p.z, 1.2)
+        end
+        if Config.Drone.destroyedSparksFx then
+          PlayPtfx(Config.Drone.destroyedSparksAsset, Config.Drone.destroyedSparksName, p.x, p.y, p.z, 0.8)
+        end
+      end
+    end
+    Wait(0)
+  end
 end
 
 local function VisualReset()
@@ -307,13 +386,19 @@ local function cleanup(reason)
   -- restore control feel
   SetPlayerControl(PlayerId(), true, 0)
 
-  if reason then
+  if reason == 'destroyed' then
+    Framework.Notify('Drone destroyed.', 'error')
+  elseif reason then
     -- local notify best-effort
-    GS.Notify(nil, ('Drone ended: %s'):format(reason), 'inform')
+    Framework.Notify(('Drone ended: %s'):format(reason), 'inform')
   end
+
+  state.droneMaxHealth = nil
+  state.lastHealth = nil
+  state.jammed = false
 end
 
-RegisterNetEvent('gs-drone:client:start', function(data)
+RegisterNetEvent('cipher-drone:client:start', function(data)
   if state.active then return end
 
   state.batteryMax = Config.Drone.batterySeconds
@@ -344,10 +429,22 @@ RegisterNetEvent('gs-drone:client:start', function(data)
   end
 
   if Config.Drone.canBeShotDown then
-    SetEntityHealth(obj, 200)
+    -- Placed drones are set invincible at placement time (see placeMode
+    -- below) before we know whether this session even allows shoot-down;
+    -- clear it here so a placed-then-connected drone can still be shot down.
+    SetEntityInvincible(obj, false)
+    local base = tonumber(Config.Drone.baseHealth) or 200
+    local mult = math.max(1.0, tonumber(Config.Drone.damageMultiplier) or 1.0)
+    local effective = math.max(1, math.floor(base / mult))
+    SetEntityMaxHealth(obj, base)
+    SetEntityHealth(obj, effective)
+    state.droneMaxHealth = effective -- the entity's actual starting HP, used as the 100% baseline for the UI
   else
     SetEntityInvincible(obj, Config.Drone.invincibleIfDisabled)
+    state.droneMaxHealth = nil
   end
+  state.lastHealth = Config.Drone.canBeShotDown and GetEntityHealth(obj) or nil
+  state.jammed = false
 
   FreezeEntityPosition(obj, false)
   SetEntityCollision(obj, true, true)
@@ -365,21 +462,21 @@ RegisterNetEvent('gs-drone:client:start', function(data)
   if not state.usingPlaced then
     NetworkRegisterEntityAsNetworked(obj)
     SetNetworkIdExistsOnAllMachines(state.droneNet, true)
-    TriggerServerEvent('gs-drone:server:registerDrone', state.droneNet)
+    TriggerServerEvent('cipher-drone:server:registerDrone', state.droneNet)
   end
 
-  -- UI + control mode
-  nui(true)
+  -- control mode (main HUD panel reveals after boot, not before)
   SetPlayerControl(PlayerId(), false, 0) -- keep player still and out of control
   setOperatorLock(true)
 
   -- boot sequence (grounded) BEFORE camera
   if not runBootSequence() then
     setOperatorLock(false)
-    nui(false)
     SetPlayerControl(PlayerId(), true, 0)
     return
   end
+
+  nui(true)
 
   -- camera
   local cam = CreateCam('DEFAULT_SCRIPTED_CAMERA', true)
@@ -406,9 +503,12 @@ RegisterNetEvent('gs-drone:client:start', function(data)
     while state.active do
       Wait(150)
       nuiUpdate()
-      TriggerServerEvent('gs-drone:server:statusTick', {
+      sendRadarUpdate()
+      local dp = (state.drone and state.drone ~= 0 and DoesEntityExist(state.drone)) and GetEntityCoords(state.drone) or nil
+      TriggerServerEvent('cipher-drone:server:statusTick', {
         battery = state.battery,
         rangeOverAt = state.rangeOverAt,
+        pos = dp and { x = dp.x, y = dp.y, z = dp.z } or nil,
       })
     end
   end)
@@ -420,6 +520,30 @@ RegisterNetEvent('gs-drone:client:start', function(data)
 
       local dt = GetFrameTime()
       if dt <= 0.0 then dt = 0.016 end
+
+      -- ===== Jamming: recompute jitter + apply periodic drift =====
+      if state.jammed then
+        local jCfg = Config.Jamming and Config.Jamming.intensity
+        if jCfg then
+          if not state.jamNextJitterAt or GetGameTimer() >= state.jamNextJitterAt then
+            state.jamNextJitterAt = GetGameTimer() + 300
+            local lo = jCfg.lookMultiplierMin or 0.6
+            local hi = jCfg.lookMultiplierMax or 1.4
+            state.jamLookMult = lo + math.random() * (hi - lo)
+          end
+          if not state.jamNextDriftAt or GetGameTimer() >= state.jamNextDriftAt then
+            state.jamNextDriftAt = GetGameTimer() + (jCfg.driftIntervalMs or 1500)
+            if state.drone and state.drone ~= 0 and DoesEntityExist(state.drone) then
+              local force = jCfg.driftForce or 0.15
+              ApplyForceToEntity(state.drone, 1,
+                (math.random() - 0.5) * force, (math.random() - 0.5) * force, (math.random() - 0.5) * force * 0.5,
+                0.0, 0.0, 0.0, 0, false, true, true, false, true)
+            end
+          end
+        end
+      else
+        state.jamLookMult = 1.0
+      end
 
       -- Lock player controls while flying the drone, but allow a small whitelist for smooth control
       DisableAllControlActions(0)
@@ -461,7 +585,7 @@ RegisterNetEvent('gs-drone:client:start', function(data)
         if math.abs(mx) < dz then mx = 0.0 end
         if math.abs(my) < dz then my = 0.0 end
 
-        local sens = (Config.Mouse.lookSensitivity or 2.2)
+        local sens = (Config.Mouse.lookSensitivity or 2.2) * (state.jamLookMult or 1.0)
         local yawSpeed = sens * 220.0
         local pitchSpeed = sens * 160.0
 
@@ -527,7 +651,7 @@ RegisterNetEvent('gs-drone:client:start', function(data)
       end
 
       if IsDisabledControlJustPressed(0, 177) then
-        TriggerServerEvent('gs-drone:server:end', 'manual')
+        TriggerServerEvent('cipher-drone:server:end', 'manual')
         MinimapLockToDrone(false)
         if droneMapBlip and DoesBlipExist(droneMapBlip) then RemoveBlip(droneMapBlip) droneMapBlip=nil end
         return
@@ -601,10 +725,32 @@ RegisterNetEvent('gs-drone:client:start', function(data)
         DrawSpotLight(spPos.x, spPos.y, spPos.z + 0.10, fwd.x, fwd.y, fwd.z, 255, 255, 245, dist, bright, falloff, radius, 1.0)
       end
 
-      -- ===== Tracker visuals (crosshair + shot tracer) =====
+      -- ===== Reticle lock-on detection (UI feedback only, drives the NUI reticle) =====
       if state.trackerCrosshair then
-        -- simple dot in center
-        DrawRect(0.5, 0.5, 0.004, 0.007, 255, 255, 255, 160)
+        if not state.lastLockCheckAt or GetGameTimer() - state.lastLockCheckAt >= 120 then
+          state.lastLockCheckAt = GetGameTimer()
+          local camCoord = GetCamCoord(state.cam)
+          local camRot = GetCamRot(state.cam, 2)
+          local lz = math.rad(camRot.z)
+          local lx = math.rad(camRot.x)
+          local lnum = math.abs(math.cos(lx))
+          local ldir = vec3(-math.sin(lz) * lnum, math.cos(lz) * lnum, math.sin(lx))
+          local ldst = camCoord + ldir * 260.0
+          local lray = StartShapeTestRay(camCoord.x, camCoord.y, camCoord.z, ldst.x, ldst.y, ldst.z, 10, state.drone, 0)
+          local _, lhit, _, _, lEntityHit = GetShapeTestResult(lray)
+
+          local locked = false
+          if lhit == 1 and lEntityHit and lEntityHit ~= 0 then
+            if (IsEntityAPed(lEntityHit) and IsPedAPlayer(lEntityHit)) or IsEntityAVehicle(lEntityHit) then
+              locked = true
+            end
+          end
+
+          if locked ~= state.reticleLocked then
+            state.reticleLocked = locked
+            SendNUIMessage({ type = 'reticle', locked = locked })
+          end
+        end
       end
 
       if state.trackerViz and state.trackerViz.untilTs and GetGameTimer() < state.trackerViz.untilTs then
@@ -627,136 +773,166 @@ RegisterNetEvent('gs-drone:client:start', function(data)
         state.battery = math.max(0, state.battery - 1)
 
         if state.battery <= 0 then
-          TriggerServerEvent('gs-drone:server:end', 'battery')
+          TriggerServerEvent('cipher-drone:server:end', 'battery')
           MinimapLockToDrone(false)
           if droneMapBlip and DoesBlipExist(droneMapBlip) then RemoveBlip(droneMapBlip) droneMapBlip=nil end
           return
         end
       end
+
+      -- ===== Shoot-down health poll =====
+      if Config.Drone.canBeShotDown and state.drone and state.drone ~= 0 then
+        if not state.lastHealthCheckAt or GetGameTimer() - state.lastHealthCheckAt >= 300 then
+          state.lastHealthCheckAt = GetGameTimer()
+          local hp = GetEntityHealth(state.drone)
+
+          if state.lastHealth and hp < state.lastHealth then
+            SendNUIMessage({ type = 'hit' })
+          end
+          state.lastHealth = hp
+
+          if hp <= 1 then
+            local droneObj = state.drone
+            runDestroySequence(droneObj)
+
+            MinimapLockToDrone(false)
+            if droneMapBlip and DoesBlipExist(droneMapBlip) then RemoveBlip(droneMapBlip) droneMapBlip=nil end
+            if DoesEntityExist(droneObj) and not state.usingPlaced then DeleteEntity(droneObj) end
+
+            TriggerServerEvent('cipher-drone:server:end', 'destroyed')
+            return
+          end
+        end
+      end
     end
   end)
 
-  -- ox_lib keybinds (if available) for clean toggles/shoot/ping
-  if GS.HasOxLib() and type(lib) == 'table' then
-    lib.addKeybind({
-      name = 'gs_drone_spotlight',
-      description = 'Drone: Toggle Spotlight',
-      defaultKey = Config.Keybinds.spotlight,
-      onPressed = function()
-        if not state.active then return end
-        state.spotlight = not state.spotlight
-        nuiUpdate()
-      end
-    })
-
-    lib.addKeybind({
-      name = 'gs_drone_thermal',
-      description = 'Drone: Toggle Thermal',
-      defaultKey = Config.Keybinds.thermal,
-      onPressed = function()
-        if not state.active then return end
-        if not Config.Camera.enableThermal then return end
-        state.thermal = not state.thermal
-        SetSeethrough(state.thermal and (Config.Camera.thermalSeeThrough == true))
-
-          -- tune see-through so it doesn't feel like full x-ray through whole buildings
-          pcall(function() SeethroughSetFadeStartDistance(Config.Camera.thermalSeeThroughFadeStart or 18.0) end)
-          pcall(function() SeethroughSetFadeEndDistance(Config.Camera.thermalSeeThroughFadeEnd or 65.0) end)
-          pcall(function() SeethroughSetHiLightIntensity(Config.Camera.thermalSeeThroughHighlightIntensity or 0.28) end)
-          pcall(function() SeethroughSetNoiseAmountMin(Config.Camera.thermalSeeThroughNoiseMin or 0.0) end)
-          pcall(function() SeethroughSetNoiseAmountMax(Config.Camera.thermalSeeThroughNoiseMax or 0.0) end)
-
-        if state.thermal and Config.Camera.thermalTimecycle then
-          SetTimecycleModifier(Config.Camera.thermalTimecycle)
-          SetTimecycleModifierStrength(Config.Camera.thermalTimecycleStrength or 0.8)
-        else
-          ClearTimecycleModifier()
-        end
-        nuiUpdate()
-      end
-    })
-
-    lib.addKeybind({
-      name = 'gs_drone_ping',
-      description = 'Drone: Ping Marker',
-      defaultKey = Config.Keybinds.ping,
-      onPressed = function()
-        if not state.active then return end
-        local pos = GetEntityCoords(state.drone)
-        SetNewWaypoint(pos.x, pos.y)
-        GS.Notify(nil, 'Pinged drone location.', 'success')
-      end
-    })
-
-    lib.addKeybind({
-      name = 'gs_drone_recall',
-      description = 'Drone: Recall / Exit',
-      defaultKey = Config.Keybinds.recall,
-      onPressed = function()
-        if not state.active then return end
-        TriggerServerEvent('gs-drone:server:end', 'recall')
-      end
-    })
-
-    lib.addKeybind({
-      name = 'gs_drone_tracker',
-      description = 'Drone: Fire Tracker Dart',
-      defaultKey = Config.Keybinds.tracker,
-      onPressed = function()
-        if not state.active then return end
-        if not Config.Tracker.enabled then return end
-
-        -- raycast from camera forward
-        local camCoord = GetCamCoord(state.cam)
-        local camRot = GetCamRot(state.cam, 2)
-        local dir = (function(rot)
-          local z = math.rad(rot.z)
-          local x = math.rad(rot.x)
-          local num = math.abs(math.cos(x))
-          return vec3(-math.sin(z) * num, math.cos(z) * num, math.sin(x))
-        end)(camRot)
-
-        local dst = camCoord + dir * 200.0
-        local ray = StartShapeTestRay(camCoord.x, camCoord.y, camCoord.z, dst.x, dst.y, dst.z, 10, state.drone, 0)
-        local _, hit, endCoords, _, entityHit = GetShapeTestResult(ray)
-
-        if hit == 1 and entityHit and entityHit ~= 0 then
-          if IsEntityAPed(entityHit) and IsPedAPlayer(entityHit) then
-            TriggerServerEvent('gs-drone:server:trackerHit', {
-              targetType = 'ped',
-              targetNet = NetworkGetNetworkIdFromEntity(entityHit),
-              targetServerId = GetPlayerServerId(NetworkGetPlayerIndexFromPed(entityHit)),
-            })
-            return
-          end
-
-          if IsEntityAVehicle(entityHit) then
-            TriggerServerEvent('gs-drone:server:trackerHit', {
-              targetType = 'veh',
-              targetNet = NetworkGetNetworkIdFromEntity(entityHit),
-            })
-            return
-          end
-        end
-
-        GS.Notify(nil, 'No valid target for tracker.', 'error')
-      end
-    })
-  end
 end)
 
-RegisterNetEvent('gs-drone:client:forceEnd', function(reason)
+RegisterNetEvent('cipher-drone:client:forceEnd', function(reason)
   cleanup(reason)
 end)
 
-RegisterNetEvent('gs-drone:client:trackerStatus', function(data)
+-- ox_lib keybinds (if available) for clean toggles/shoot/ping. Registered
+-- once at resource start, NOT inside the per-session 'start' handler above
+-- (previously nested there, which re-registered all 5 keybinds every time
+-- a drone session began, stacking duplicate handlers over a play session).
+if Framework.HasOxLib() and type(lib) == 'table' then
+  lib.addKeybind({
+    name = 'cipher_drone_spotlight',
+    description = 'Drone: Toggle Spotlight',
+    defaultKey = Config.Keybinds.spotlight,
+    onPressed = function()
+      if not state.active then return end
+      state.spotlight = not state.spotlight
+      nuiUpdate()
+    end
+  })
+
+  lib.addKeybind({
+    name = 'cipher_drone_thermal',
+    description = 'Drone: Toggle Thermal',
+    defaultKey = Config.Keybinds.thermal,
+    onPressed = function()
+      if not state.active then return end
+      if not Config.Camera.enableThermal then return end
+      state.thermal = not state.thermal
+      SetSeethrough(state.thermal and (Config.Camera.thermalSeeThrough == true))
+
+        -- tune see-through so it doesn't feel like full x-ray through whole buildings
+        pcall(function() SeethroughSetFadeStartDistance(Config.Camera.thermalSeeThroughFadeStart or 18.0) end)
+        pcall(function() SeethroughSetFadeEndDistance(Config.Camera.thermalSeeThroughFadeEnd or 65.0) end)
+        pcall(function() SeethroughSetHiLightIntensity(Config.Camera.thermalSeeThroughHighlightIntensity or 0.28) end)
+        pcall(function() SeethroughSetNoiseAmountMin(Config.Camera.thermalSeeThroughNoiseMin or 0.0) end)
+        pcall(function() SeethroughSetNoiseAmountMax(Config.Camera.thermalSeeThroughNoiseMax or 0.0) end)
+
+      if state.thermal and Config.Camera.thermalTimecycle then
+        SetTimecycleModifier(Config.Camera.thermalTimecycle)
+        SetTimecycleModifierStrength(Config.Camera.thermalTimecycleStrength or 0.8)
+      else
+        ClearTimecycleModifier()
+      end
+      nuiUpdate()
+    end
+  })
+
+  lib.addKeybind({
+    name = 'cipher_drone_ping',
+    description = 'Drone: Ping Marker',
+    defaultKey = Config.Keybinds.ping,
+    onPressed = function()
+      if not state.active then return end
+      local pos = GetEntityCoords(state.drone)
+      SetNewWaypoint(pos.x, pos.y)
+      Framework.Notify('Pinged drone location.', 'success')
+    end
+  })
+
+  lib.addKeybind({
+    name = 'cipher_drone_recall',
+    description = 'Drone: Recall / Exit',
+    defaultKey = Config.Keybinds.recall,
+    onPressed = function()
+      if not state.active then return end
+      TriggerServerEvent('cipher-drone:server:end', 'recall')
+    end
+  })
+
+  lib.addKeybind({
+    name = 'cipher_drone_tracker',
+    description = 'Drone: Fire Tracker Dart',
+    defaultKey = Config.Keybinds.tracker,
+    onPressed = function()
+      if not state.active then return end
+      if not Config.Tracker.enabled then return end
+
+      -- raycast from camera forward
+      local camCoord = GetCamCoord(state.cam)
+      local camRot = GetCamRot(state.cam, 2)
+      local dir = (function(rot)
+        local z = math.rad(rot.z)
+        local x = math.rad(rot.x)
+        local num = math.abs(math.cos(x))
+        return vec3(-math.sin(z) * num, math.cos(z) * num, math.sin(x))
+      end)(camRot)
+
+      local dst = camCoord + dir * 200.0
+      local ray = StartShapeTestRay(camCoord.x, camCoord.y, camCoord.z, dst.x, dst.y, dst.z, 10, state.drone, 0)
+      local _, hit, endCoords, _, entityHit = GetShapeTestResult(ray)
+
+      SendNUIMessage({ type = 'dartFired' })
+
+      if hit == 1 and entityHit and entityHit ~= 0 then
+        if IsEntityAPed(entityHit) and IsPedAPlayer(entityHit) then
+          TriggerServerEvent('cipher-drone:server:trackerHit', {
+            targetType = 'ped',
+            targetNet = NetworkGetNetworkIdFromEntity(entityHit),
+            targetServerId = GetPlayerServerId(NetworkGetPlayerIndexFromPed(entityHit)),
+          })
+          return
+        end
+
+        if IsEntityAVehicle(entityHit) then
+          TriggerServerEvent('cipher-drone:server:trackerHit', {
+            targetType = 'veh',
+            targetNet = NetworkGetNetworkIdFromEntity(entityHit),
+          })
+          return
+        end
+      end
+
+      Framework.Notify('No valid target for tracker.', 'error')
+    end
+  })
+end
+
+RegisterNetEvent('cipher-drone:client:trackerStatus', function(data)
   if not Config.UI.enabled then return end
   SendNUIMessage({ type = 'trackerCd', seconds = data and data.cooldown or 0 })
 end)
 
 -- Viewer pings for jobs/perms: create/update blips client-side
-local trackerBlips = {} -- [trackerId] = blip
-RegisterNetEvent('gs-drone:client:trackerPing', function(data)
+RegisterNetEvent('cipher-drone:client:trackerPing', function(data)
   if not data or not data.trackerId or not data.targetNet then return end
 
   local ent = NetToEnt(data.targetNet)
@@ -768,20 +944,6 @@ RegisterNetEvent('gs-drone:client:trackerPing', function(data)
   -- remember last known tracker position (follows the target)
   state.lastTrackerPos = pos
   state.lastTrackerAt = GetGameTimer()
-
-  local maxDist = (Config.Tracker and Config.Tracker.maxDistance) or nil
-  if maxDist then
-    local viewer = PlayerPedId()
-    if viewer and viewer ~= 0 then
-      local vp = GetEntityCoords(viewer)
-      if #(pos - vp) > maxDist then
-        local blip = trackerBlips[data.trackerId]
-        if blip and DoesBlipExist(blip) then RemoveBlip(blip) end
-        trackerBlips[data.trackerId] = nil
-        return
-      end
-    end
-  end
 
   -- Lose tracking if target leaves range from original dart attach point
   local maxDist = (Config.Tracker and Config.Tracker.maxDistance) or nil
@@ -828,33 +990,20 @@ CreateThread(function()
 end)
 
 
--- Fallback key handling if ox_lib isn't running
-CreateThread(function()
-  while true do
-    Wait(0)
-    if state.active and not GS.HasOxLib() then
-      -- Spotlight (F)
-      if IsControlJustPressed(0, 23) then -- INPUT_ENTER (F-ish on kb layouts, but not perfect)
-        state.spotlight = not state.spotlight
-        nuiUpdate()
-      end
+-- RegisterKeyMapping based binds (works without ox_lib). Gated behind
+-- HasOxLib() so these don't double-fire alongside the lib.addKeybind
+-- handlers above when ox_lib IS running (previously unconditional, which
+-- meant every key press fired both handlers at once).
+if not Framework.HasOxLib() then
 
-      -- Thermal (T) - best effort using INPUT_CHARACTER_WHEEL (19) is wrong; use RegisterKeyMapping below instead.
-    else
-      Wait(250)
-    end
-  end
-end)
-
--- RegisterKeyMapping based binds (works without ox_lib)
-RegisterCommand('gs_drone_spotlight', function()
+RegisterCommand('cipher_drone_spotlight', function()
   if not state.active then return end
   state.spotlight = not state.spotlight
   nuiUpdate()
 end, false)
-RegisterKeyMapping('gs_drone_spotlight', 'Drone: Toggle Spotlight', 'keyboard', Config.Keybinds.spotlight)
+RegisterKeyMapping('cipher_drone_spotlight', 'Drone: Toggle Spotlight', 'keyboard', Config.Keybinds.spotlight)
 
-RegisterCommand('gs_drone_thermal', function()
+RegisterCommand('cipher_drone_thermal', function()
   if not state.active then return end
   if not Config.Camera.enableThermal then return end
   state.thermal = not state.thermal
@@ -875,20 +1024,20 @@ RegisterCommand('gs_drone_thermal', function()
   end
   nuiUpdate()
 end, false)
-RegisterKeyMapping('gs_drone_thermal', 'Drone: Toggle Thermal', 'keyboard', Config.Keybinds.thermal)
+RegisterKeyMapping('cipher_drone_thermal', 'Drone: Toggle Thermal', 'keyboard', Config.Keybinds.thermal)
 
-RegisterCommand('gs_drone_ping', function()
+RegisterCommand('cipher_drone_ping', function()
   if not state.active then return end
 
   local id = state.lastTrackerId
   if not id then
-    GS.Notify(nil, 'No tracker dart to ping yet.', 'error')
+    Framework.Notify('No tracker dart to ping yet.', 'error')
     return
   end
 
   local blip = trackerBlips and trackerBlips[id] or nil
   if not blip or not DoesBlipExist(blip) then
-    GS.Notify(nil, 'Tracker ping not active yet (wait a moment).', 'error')
+    Framework.Notify('Tracker ping not active yet (wait a moment).', 'error')
     return
   end
 
@@ -897,20 +1046,20 @@ RegisterCommand('gs_drone_ping', function()
   SetBlipRouteColour(blip, 3)
 
   if state.routeOn then
-    GS.Notify(nil, 'Routing to tracker target.', 'success')
+    Framework.Notify('Routing to tracker target.', 'success')
   else
-    GS.Notify(nil, 'Tracker route cleared.', 'success')
+    Framework.Notify('Tracker route cleared.', 'success')
   end
 end, false)
-RegisterKeyMapping('gs_drone_ping', 'Drone: Ping Marker', 'keyboard', Config.Keybinds.ping)
+RegisterKeyMapping('cipher_drone_ping', 'Drone: Ping Marker', 'keyboard', Config.Keybinds.ping)
 
-RegisterCommand('gs_drone_recall', function()
+RegisterCommand('cipher_drone_recall', function()
   if not state.active then return end
-  TriggerServerEvent('gs-drone:server:end', 'recall')
+  TriggerServerEvent('cipher-drone:server:end', 'recall')
 end, false)
-RegisterKeyMapping('gs_drone_recall', 'Drone: Recall / Exit', 'keyboard', Config.Keybinds.recall)
+RegisterKeyMapping('cipher_drone_recall', 'Drone: Recall / Exit', 'keyboard', Config.Keybinds.recall)
 
-RegisterCommand('gs_drone_tracker', function()
+RegisterCommand('cipher_drone_tracker', function()
   if not state.active then return end
   if not Config.Tracker.enabled then return end
 
@@ -924,6 +1073,8 @@ RegisterCommand('gs_drone_tracker', function()
   local dst = camCoord + dir * 260.0
   local ray = StartShapeTestRay(camCoord.x, camCoord.y, camCoord.z, dst.x, dst.y, dst.z, 10, state.drone, 0)
   local _, hit, endCoords, _, entityHit = GetShapeTestResult(ray)
+
+  SendNUIMessage({ type = 'dartFired' })
 
   TrackerVisual(camCoord, endCoords or dst, hit == 1)
   if endCoords then
@@ -940,7 +1091,7 @@ RegisterCommand('gs_drone_tracker', function()
   PlaySoundFrontend(-1, "Firing_Pin_Good", "DLC_HEIST_BIOLAB_PREP_HACKING_SOUNDS", true)
 
   if hit ~= 1 or not entityHit or entityHit == 0 then
-    GS.Notify(nil, 'No valid target for tracker.', 'error')
+    Framework.Notify('No valid target for tracker.', 'error')
     return
   end
 
@@ -950,7 +1101,7 @@ RegisterCommand('gs_drone_tracker', function()
     local targetNet = NetworkGetNetworkIdFromEntity(entityHit)
     local myNet = NetworkGetNetworkIdFromEntity(PlayerPedId())
     if targetNet == myNet then
-      GS.Notify(nil, 'Cannot tag yourself with tracker.', 'error')
+      Framework.Notify('Cannot tag yourself with tracker.', 'error')
       return
     end
 
@@ -962,30 +1113,32 @@ RegisterCommand('gs_drone_tracker', function()
       local sid = ply and GetPlayerServerId(ply) or 0
       local meSid = GetPlayerServerId(PlayerId())
       if sid == 0 or sid == meSid then
-        GS.Notify(nil, 'Cannot tag yourself with tracker.', 'error')
+        Framework.Notify('Cannot tag yourself with tracker.', 'error')
         return
       end
       payload.targetServerId = sid
     end
 
-    TriggerServerEvent('gs-drone:server:trackerHit', payload)
+    TriggerServerEvent('cipher-drone:server:trackerHit', payload)
     return
   end
 
   if IsEntityAVehicle(entityHit) then
     payload.targetType = 'veh'
     payload.targetNet = NetworkGetNetworkIdFromEntity(entityHit)
-    TriggerServerEvent('gs-drone:server:trackerHit', payload)
+    TriggerServerEvent('cipher-drone:server:trackerHit', payload)
     return
   end
 
-  GS.Notify(nil, 'No valid target for tracker.', 'error')
+  Framework.Notify('No valid target for tracker.', 'error')
 end, false)
-RegisterKeyMapping('gs_drone_tracker', 'Drone: Fire Tracker Dart', 'keyboard', Config.Keybinds.tracker)
+RegisterKeyMapping('cipher_drone_tracker', 'Drone: Fire Tracker Dart', 'keyboard', Config.Keybinds.tracker)
+
+end -- if not Framework.HasOxLib()
 
 
 
-RegisterNetEvent('gs-drone:client:trackerExpired', function(data)
+RegisterNetEvent('cipher-drone:client:trackerExpired', function(data)
   if not data or not data.trackerId then return end
   local blip = trackerBlips[data.trackerId]
   if blip and DoesBlipExist(blip) then
@@ -996,9 +1149,21 @@ end)
 
 -- If YOU are the tracked target (ped), we can apply environment decay (rain/water) client-side and report to server
 local selfTrackers = {} -- [trackerId] = expiresAt
-RegisterNetEvent('gs-drone:client:trackerAttachedSelf', function(data)
+RegisterNetEvent('cipher-drone:client:trackerAttachedSelf', function(data)
   if not data or not data.trackerId then return end
   selfTrackers[data.trackerId] = tonumber(data.expiresAt or 0) or 0
+end)
+
+-- Server is authoritative on jammed state (distance-tick against active
+-- jammers); we only render the degraded-control effect here.
+RegisterNetEvent('cipher-drone:client:jammed', function(isJammed)
+  state.jammed = isJammed and true or false
+  if not state.jammed then
+    state.jamLookMult = 1.0
+  end
+  if Config.UI.enabled then
+    SendNUIMessage({ type = 'jammed', state = state.jammed })
+  end
 end)
 
 CreateThread(function()
@@ -1030,7 +1195,7 @@ CreateThread(function()
     if decay <= 0 then goto continue end
 
     for trackerId, _ in pairs(selfTrackers) do
-      TriggerServerEvent('gs-drone:server:decayTracker', trackerId, decay)
+      TriggerServerEvent('cipher-drone:server:decayTracker', trackerId, decay)
     end
 
     ::continue::
@@ -1042,7 +1207,7 @@ end)
 do
   local showing = false
   local function showPrompt(text)
-    if GS.HasOxLib() and lib and lib.showTextUI then
+    if Framework.HasOxLib() and lib and lib.showTextUI then
       if not showing then
         lib.showTextUI(text, { position = 'left-center' })
         showing = true
@@ -1056,7 +1221,7 @@ do
   end
 
   local function hidePrompt()
-    if GS.HasOxLib() and lib and lib.hideTextUI then
+    if Framework.HasOxLib() and lib and lib.hideTextUI then
       if showing then
         lib.hideTextUI()
         showing = false
@@ -1114,7 +1279,7 @@ do
       -- E
       if IsControlJustPressed(0, 38) then
         local netId = NetworkGetNetworkIdFromEntity(veh)
-        TriggerServerEvent('gs-drone:server:removeVehicleTrackers', netId)
+        TriggerServerEvent('cipher-drone:server:removeVehicleTrackers', netId)
         Wait(1000)
       end
 
@@ -1157,138 +1322,8 @@ AddEventHandler('playerSpawned', function()
 end)
 
 
--- Tracker: show tracked target for PD (and optionally for shooter)
-local trackerBlip = nil
-local trackerTarget = nil
 
-RegisterNetEvent('gs-drone:client:trackerActive', function(track)
-  if not track or type(track) ~= 'table' then return end
-  -- PD-only viewing
-  if not GS.HasJob or not GS.HasJob(Config.Tracker.pdJobs or {}) then return end
-
-  trackerTarget = track
-  if trackerBlip and DoesBlipExist(trackerBlip) then
-    RemoveBlip(trackerBlip)
-    trackerBlip = nil
-  end
-
-  CreateThread(function()
-    local untilTs = (GetGameTimer() + ((Config.Tracker.duration or 120) * 1000))
-    while trackerTarget == track and GetGameTimer() < untilTs do
-      local ent = 0
-      if track.kind == 'player' and track.targetSid then
-        local pid = GetPlayerFromServerId(track.targetSid)
-        if pid ~= -1 then
-          ent = GetPlayerPed(pid)
-        end
-      elseif track.kind == 'veh' and track.targetNet then
-        ent = NetToVeh(track.targetNet)
-      end
-
-      if ent and ent ~= 0 and DoesEntityExist(ent) then
-        if not trackerBlip or not DoesBlipExist(trackerBlip) then
-          trackerBlip = AddBlipForEntity(ent)
-          SetBlipSprite(trackerBlip, 161) -- radius/target
-          SetBlipScale(trackerBlip, 0.9)
-          SetBlipColour(trackerBlip, 3)
-          BeginTextCommandSetBlipName('STRING')
-          AddTextComponentString('Tracker Target')
-          EndTextCommandSetBlipName(trackerBlip)
-        end
-      end
-
-      Wait(500)
-    end
-
-    if trackerBlip and DoesBlipExist(trackerBlip) then
-      RemoveBlip(trackerBlip)
-      trackerBlip = nil
-    end
-    if trackerTarget == track then
-      trackerTarget = nil
-    end
-  end)
-end)
-
-
-local function IsPoliceJob()
-  local job = (GS and GS.GetJob and GS.GetJob()) or nil
-  local name = job and (job.name or job) or nil
-  if not name then return false end
-  local list = (Config.Tracker and Config.Tracker.pdJobs) or {}
-  for _, j in ipairs(list) do
-    if j == name then return true end
-  end
-  return false
-end
-
-
-
--- Tracker: show tracked target blip (PD + shooter)
-local trackerBlip = nil
-local trackerTarget = nil
-
-RegisterNetEvent('gs-drone:client:trackerActive', function(track)
-  if not track or type(track) ~= 'table' then return end
-
-  local me = GetPlayerServerId(PlayerId())
-  local canSee = false
-  if track.by and tonumber(track.by) == tonumber(me) then
-    canSee = true -- shooter always sees their own track
-  elseif IsPoliceJob() then
-    canSee = true
-  end
-  if not canSee then return end
-
-  trackerTarget = track
-
-  if trackerBlip and DoesBlipExist(trackerBlip) then
-    RemoveBlip(trackerBlip)
-    trackerBlip = nil
-  end
-
-  local refresh = (Config.Tracker and Config.Tracker.blipRefresh) or 250
-  local untilTs = GetGameTimer() + (((Config.Tracker and Config.Tracker.duration) or 120) * 1000)
-
-  CreateThread(function()
-    while trackerTarget == track and GetGameTimer() < untilTs do
-      local ent = 0
-      if track.kind == 'player' and track.targetSid then
-        local pid = GetPlayerFromServerId(track.targetSid)
-        if pid ~= -1 then ent = GetPlayerPed(pid) end
-      elseif track.kind == 'veh' and track.targetNet then
-        ent = NetToVeh(track.targetNet)
-      end
-
-      if ent ~= 0 and DoesEntityExist(ent) then
-        if not trackerBlip or not DoesBlipExist(trackerBlip) then
-          trackerBlip = AddBlipForEntity(ent)
-          SetBlipSprite(trackerBlip, 480) -- target
-          SetBlipScale(trackerBlip, 0.9)
-          SetBlipColour(trackerBlip, 3)
-          SetBlipAsShortRange(trackerBlip, false)
-          BeginTextCommandSetBlipName('STRING')
-          AddTextComponentString('Tracker Target')
-          EndTextCommandSetBlipName(trackerBlip)
-        end
-      end
-
-      Wait(refresh)
-    end
-
-    if trackerBlip and DoesBlipExist(trackerBlip) then
-      RemoveBlip(trackerBlip)
-      trackerBlip = nil
-    end
-    if trackerTarget == track then trackerTarget = nil end
-  end)
-end)
-
-
-
-
-
-RegisterNetEvent('gs-drone:client:placeMode', function()
+RegisterNetEvent('cipher-drone:client:placeMode', function()
   if state.active or state.placedMode then return end
   state.placedMode = true
 
@@ -1301,7 +1336,7 @@ RegisterNetEvent('gs-drone:client:placeMode', function()
   FreezeEntityPosition(ghost, true)
   state.placedGhost = ghost
 
-  GS.Notify(nil, 'Place drone: [E] confirm, [Backspace] cancel', 'success')
+  Framework.Notify('Place drone: [E] confirm, [Backspace] cancel', 'success')
 
   CreateThread(function()
     while state.placedMode do
@@ -1346,13 +1381,13 @@ RegisterNetEvent('gs-drone:client:placeMode', function()
 
         if netId == 0 then
           DeleteEntity(obj)
-          GS.Notify(nil, 'Failed to network drone (OneSync required).', 'error')
+          Framework.Notify('Failed to network drone (OneSync required).', 'error')
           return
         end
 
         SetNetworkIdExistsOnAllMachines(netId, true)
         SetNetworkIdCanMigrate(netId, true)
-        TriggerServerEvent('gs-drone:server:placeConfirm', { netId = netId, x = place.x, y = place.y, z = place.z, h = heading })
+        TriggerServerEvent('cipher-drone:server:placeConfirm', { netId = netId, x = place.x, y = place.y, z = place.z, h = heading })
         return
       end
 
@@ -1360,7 +1395,7 @@ RegisterNetEvent('gs-drone:client:placeMode', function()
         state.placedMode = false
         DeleteEntity(ghost)
         state.placedGhost = 0
-        GS.Notify(nil, 'Placement canceled.', 'error')
+        Framework.Notify('Placement canceled.', 'error')
         return
       end
 
@@ -1369,7 +1404,7 @@ RegisterNetEvent('gs-drone:client:placeMode', function()
   end)
 end)
 
-RegisterNetEvent('gs-drone:client:placed', function(data)
+RegisterNetEvent('cipher-drone:client:placed', function(data)
   -- placeholder (ox_target handles interaction)
 end)
 
@@ -1377,7 +1412,7 @@ CreateThread(function()
   if GetResourceState('ox_target') ~= 'started' then return end
   exports.ox_target:addModel({ Config.Drone.model }, {
     {
-      name = 'gs_drone_connect',
+      name = 'cipher_drone_connect',
       icon = 'fa-solid fa-satellite-dish',
       label = 'Connect / Fly Drone',
       distance = 2.0,
@@ -1387,11 +1422,11 @@ CreateThread(function()
       onSelect = function(data)
         local ent = data.entity
         if not ent or ent == 0 then return end
-        TriggerServerEvent('gs-drone:server:connectPlaced', NetworkGetNetworkIdFromEntity(ent))
+        TriggerServerEvent('cipher-drone:server:connectPlaced', NetworkGetNetworkIdFromEntity(ent))
       end
     },
     {
-      name = 'gs_drone_pack',
+      name = 'cipher_drone_pack',
       icon = 'fa-solid fa-box',
       label = 'Pack Drone',
       distance = 2.0,
@@ -1401,14 +1436,14 @@ CreateThread(function()
       onSelect = function(data)
         local ent = data.entity
         if not ent or ent == 0 then return end
-        TriggerServerEvent('gs-drone:server:packDrone', NetworkGetNetworkIdFromEntity(ent))
+        TriggerServerEvent('cipher-drone:server:packDrone', NetworkGetNetworkIdFromEntity(ent))
       end
     }
   })
 end)
 
 
-RegisterNetEvent('gs-drone:client:deletePlaced', function(netId)
+RegisterNetEvent('cipher-drone:client:deletePlaced', function(netId)
   netId = tonumber(netId or 0) or 0
   if netId <= 0 then return end
   local ent = NetToObj(netId)
